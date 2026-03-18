@@ -75,8 +75,6 @@ def train_candidates(
     *,
     seed: int,
     show_progress: bool = True,
-    save_model: bool = False,
-    model_save_dir: Path | None = None,
 ) -> list[TrainResult]:
     model_factories = build_model_factories(seed=seed)
     candidates = [
@@ -84,12 +82,8 @@ def train_candidates(
         for feature_name in sorted(train_feature_sets.keys())
         for model_name in model_factories.keys()
     ]
-    
-    if save_model and model_save_dir is None:
-        raise ValueError("model_save_dir must be provided when save_model is True.")
 
     results: list[TrainResult] = []
-    best_scores_by_model: dict[str, tuple[float, float]] = {}
     bar = _pair_progress_bar(len(candidates)) if show_progress else None
     for model_name, feature_name in candidates:
         estimator = clone(model_factories[model_name])
@@ -160,10 +154,6 @@ def train_candidates(
                 test_accuracy=test_acc,
             )
         )
-        if save_model:
-            if model_name not in best_scores_by_model or test_acc > best_scores_by_model[model_name][0]:
-                best_scores_by_model[model_name] = (test_acc, val_acc, train_acc, train_seconds)
-                save(estimator, model_save_dir / f"{model_name}_{feature_name}.pkl")
     if bar is not None:
         bar.close()
     # sort the results by test accuracy, or val accuracy if test accuracy is the same
@@ -192,6 +182,7 @@ def run_traditional_ml_pipeline(
     test_dataset: PipelineDataset | None = None,
     test_base_features: dict[str, np.ndarray] | None = None,
     save_model: bool = False,
+    clean_model_directory: bool = False,
 ) -> MLPipelineOutput:
     set_seed(config.seed)
 
@@ -269,8 +260,6 @@ def run_traditional_ml_pipeline(
         split=split,
         seed=config.seed,
         show_progress=config.show_progress,
-        save_model=save_model,
-        model_save_dir=output_dir / "models",
     )
 
     train_results_by_model: dict[str, list[TrainResult]] = {}
@@ -278,6 +267,28 @@ def run_traditional_ml_pipeline(
         if result.model_name not in train_results_by_model:
             train_results_by_model[result.model_name] = []
         train_results_by_model[result.model_name].append(result)
+
+    model_save_dir = output_dir / "models"
+    if save_model:
+        if model_save_dir is None:
+            raise ValueError("model_save_dir must be provided when save_model is True.")
+        if model_save_dir.exists():
+            if clean_model_directory:
+                for file in model_save_dir.glob("*"):
+                    file.unlink()
+        else:
+            model_save_dir.mkdir(parents=True, exist_ok=True)
+        models_to_save = []
+        for _, value in train_results_by_model.items():
+            models_to_save.append(value[0])
+
+        models_to_save.sort(key=lambda x: x.test_accuracy, reverse=True)
+
+        for i, top_model in enumerate(models_to_save):
+            save(
+                top_model.estimator,
+                model_save_dir / f"{1+i}_{top_model.model_name}_{top_model.feature_name}.pkl",
+            )
 
     return MLPipelineOutput(
         dataset_dir=config.data_root / config.dataset_subdir,
