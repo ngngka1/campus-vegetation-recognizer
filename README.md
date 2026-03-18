@@ -30,8 +30,8 @@ Then open [http://127.0.0.1:7860](http://127.0.0.1:7860).
 
 ### How to use
 
-1. Provide a model path (or keep the auto-detected one if available).
-2. Provide a feature combination used when training (or leave blank to infer from model filename).
+1. Select a model from the dropdown (auto-detected from `ml_results/models/`).
+2. The feature combination is inferred automatically from the selected model filename.
 3. Either:
    - upload an image in **Upload Image**, or
    - pick an image from **Select Existing Sample**.

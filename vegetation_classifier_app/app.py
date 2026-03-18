@@ -1,4 +1,5 @@
 from __future__ import annotations
+print("Resolving imports...")
 
 import sys
 from pathlib import Path
@@ -19,6 +20,10 @@ from dataset_loader import build_feature_sets  # noqa: E402
 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}
 KNOWN_MODELS = ("random_forest", "svm", "knn")
+MODEL_SUFFIXES = {".pkl", ".joblib"}
+_MODEL_CACHE: dict[str, object] = {}
+DEFAULT_IMG_SIZE = 128
+DEFAULT_INCLUDE_SURF = False
 
 
 def _iter_files(root: Path, suffixes: Iterable[str]) -> list[Path]:
@@ -32,9 +37,14 @@ def _iter_files(root: Path, suffixes: Iterable[str]) -> list[Path]:
 
 
 def _find_default_model_path() -> str:
-    models_dir = PROJECT_ROOT / "ml_results" / "models"
-    candidates = _iter_files(models_dir, {".pkl", ".joblib"})
+    candidates = _find_model_paths()
     return str(candidates[0]) if candidates else ""
+
+
+def _find_model_paths() -> list[str]:
+    models_dir = PROJECT_ROOT / "ml_results" / "models"
+    candidates = _iter_files(models_dir, MODEL_SUFFIXES)
+    return [str(p) for p in candidates]
 
 
 def _find_sample_images() -> list[str]:
@@ -66,32 +76,36 @@ def _preprocess_to_bgr(image_rgb: np.ndarray, img_size: int) -> np.ndarray:
     return cv2.cvtColor(resized, cv2.COLOR_RGB2BGR)
 
 
+def _get_cached_model(model_file: Path) -> object:
+    key = str(model_file.resolve())
+    if key not in _MODEL_CACHE:
+        _MODEL_CACHE[key] = load(model_file)
+    return _MODEL_CACHE[key]
+
+
+def _feature_combo_for_model(model_path: str) -> str:
+    combo = _infer_feature_combo_from_model_name(model_path).strip()
+    if not combo:
+        raise ValueError(
+            "Cannot infer feature combination from selected model filename."
+        )
+    return combo
+
+
 def _predict_from_bgr(
     image_bgr: np.ndarray,
     model_path: str,
-    feature_combo: str,
-    img_size: int,
-    include_surf_if_available: bool,
 ) -> tuple[str, str]:
     model_file = Path(model_path).expanduser()
     if not model_file.exists():
         raise FileNotFoundError(f"Model file does not exist: {model_file}")
-
-    cleaned_feature_combo = feature_combo.strip()
-    if not cleaned_feature_combo:
-        inferred = _infer_feature_combo_from_model_name(model_path)
-        if not inferred:
-            raise ValueError(
-                "Feature combination is empty and cannot be inferred from model filename."
-            )
-        cleaned_feature_combo = inferred
-
-    model = load(model_file)
+    cleaned_feature_combo = _feature_combo_for_model(model_path)
+    model = _get_cached_model(model_file)
     feature_sets = build_feature_sets(
         [image_bgr],
-        img_size=img_size,
+        img_size=DEFAULT_IMG_SIZE,
         feature_combinations=(cleaned_feature_combo,),
-        include_surf_if_available=include_surf_if_available,
+        include_surf_if_available=DEFAULT_INCLUDE_SURF,
     )
     x = feature_sets[cleaned_feature_combo]
     pred = model.predict(x)[0]
@@ -100,7 +114,7 @@ def _predict_from_bgr(
         f"Predicted class: {pred}",
         f"Model: {model_file.name}",
         f"Feature combination: {cleaned_feature_combo}",
-        f"Input size: {img_size}x{img_size}",
+        f"Input size: {DEFAULT_IMG_SIZE}x{DEFAULT_IMG_SIZE}",
     ]
 
     if hasattr(model, "predict_proba"):
@@ -125,17 +139,11 @@ def _predict_from_bgr(
 def predict_uploaded(
     image_rgb: np.ndarray,
     model_path: str,
-    feature_combo: str,
-    img_size: int,
-    include_surf_if_available: bool,
 ) -> tuple[str, str]:
-    bgr = _preprocess_to_bgr(image_rgb, img_size=img_size)
+    bgr = _preprocess_to_bgr(image_rgb, img_size=DEFAULT_IMG_SIZE)
     return _predict_from_bgr(
         image_bgr=bgr,
         model_path=model_path,
-        feature_combo=feature_combo,
-        img_size=img_size,
-        include_surf_if_available=include_surf_if_available,
     )
 
 
@@ -154,9 +162,6 @@ def load_sample_preview(sample_rel_path: str) -> np.ndarray | None:
 def predict_sample(
     sample_rel_path: str,
     model_path: str,
-    feature_combo: str,
-    img_size: int,
-    include_surf_if_available: bool,
 ) -> tuple[str, str]:
     if not sample_rel_path:
         raise ValueError("Please select a sample image.")
@@ -166,18 +171,46 @@ def predict_sample(
     bgr = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
     if bgr is None:
         raise ValueError(f"Failed to read selected sample image: {img_path}")
-    resized = cv2.resize(bgr, (img_size, img_size), interpolation=cv2.INTER_AREA)
+    resized = cv2.resize(
+        bgr, (DEFAULT_IMG_SIZE, DEFAULT_IMG_SIZE), interpolation=cv2.INTER_AREA
+    )
     return _predict_from_bgr(
         image_bgr=resized,
         model_path=model_path,
-        feature_combo=feature_combo,
-        img_size=img_size,
-        include_surf_if_available=include_surf_if_available,
     )
 
 
+def update_feature_combo(model_path: str) -> str:
+    if not model_path:
+        return ""
+    try:
+        return _feature_combo_for_model(model_path)
+    except ValueError:
+        return ""
+
+
+def warm_up_default_model(default_model_path: str, img_size: int = 128) -> None:
+    if not default_model_path:
+        return
+    try:
+        model_file = Path(default_model_path).expanduser()
+        _get_cached_model(model_file)
+        combo = _feature_combo_for_model(default_model_path)
+        dummy = np.zeros((img_size, img_size, 3), dtype=np.uint8)
+        features = build_feature_sets(
+            [dummy],
+            img_size=img_size,
+            feature_combinations=(combo,),
+            include_surf_if_available=False,
+        )
+        _MODEL_CACHE[str(model_file.resolve())].predict(features[combo])
+    except Exception as exc:
+        print(f"[WARN] Startup warm-up skipped: {exc}")
+
+
 def build_interface() -> gr.Blocks:
-    default_model_path = _find_default_model_path()
+    model_choices = _find_model_paths()
+    default_model_path = model_choices[0] if model_choices else ""
     sample_images = _find_sample_images()
     inferred_feature = (
         _infer_feature_combo_from_model_name(default_model_path) if default_model_path else ""
@@ -192,62 +225,66 @@ def build_interface() -> gr.Blocks:
         )
 
         with gr.Row():
-            model_path = gr.Textbox(
-                label="Model path (.pkl or .joblib)",
-                value=default_model_path,
-                placeholder="e.g. ml_results/models/1_svm_hog+sift.pkl",
-            )
-            feature_combo = gr.Textbox(
-                label="Feature combination",
-                value=inferred_feature,
-                placeholder="e.g. hog+sift",
-            )
-        with gr.Row():
-            img_size = gr.Number(label="Image size", value=128, precision=0)
-            include_surf = gr.Checkbox(
-                label="Enable SURF feature support if available", value=False
-            )
+            with gr.Column(scale=1):
+                model_path = gr.Dropdown(
+                    label="Select model (.pkl or .joblib)",
+                    choices=model_choices,
+                    value=default_model_path,
+                    allow_custom_value=False,
+                )
+                feature_combo = gr.Textbox(
+                    label="Feature combination",
+                    value=inferred_feature,
+                    interactive=False,
+                )
+                pred_label = gr.Textbox(label="Predicted class")
+                pred_details = gr.Textbox(label="Details", lines=8)
 
-        pred_label = gr.Textbox(label="Predicted class")
-        pred_details = gr.Textbox(label="Details", lines=8)
+            with gr.Column(scale=1):
+                upload_image = gr.Image(label="Upload image", type="numpy")
+                upload_btn = gr.Button("Predict from uploaded image", variant="primary")
+                upload_btn.click(
+                    fn=predict_uploaded,
+                    inputs=[upload_image, model_path],
+                    outputs=[pred_label, pred_details],
+                )
+                sample_preview = gr.Image(
+                    label="Selected image preview (from polyu_vegetation/test)",
+                    type="numpy",
+                )
+                sample_dropdown = gr.Dropdown(
+                    label="Choose sample image",
+                    choices=sample_images,
+                    value=sample_images[0] if sample_images else None,
+                )
+                sample_dropdown.change(
+                    fn=load_sample_preview, inputs=sample_dropdown, outputs=sample_preview
+                )
+                sample_btn = gr.Button("Predict selected sample", variant="secondary")
+                sample_btn.click(
+                    fn=predict_sample,
+                    inputs=[sample_dropdown, model_path],
+                    outputs=[pred_label, pred_details],
+                )
 
-        with gr.Tab("Upload Image"):
-            upload_image = gr.Image(label="Upload image", type="numpy")
-            upload_btn = gr.Button("Predict from uploaded image", variant="primary")
-            upload_btn.click(
-                fn=predict_uploaded,
-                inputs=[upload_image, model_path, feature_combo, img_size, include_surf],
-                outputs=[pred_label, pred_details],
-            )
-
-        with gr.Tab("Select Existing Sample"):
-            sample_dropdown = gr.Dropdown(
-                label="Choose sample image from polyu_vegetation/test",
-                choices=sample_images,
-                value=sample_images[0] if sample_images else None,
-            )
-            sample_preview = gr.Image(label="Selected image preview", type="numpy")
-            sample_dropdown.change(
-                fn=load_sample_preview, inputs=sample_dropdown, outputs=sample_preview
-            )
-            sample_btn = gr.Button("Predict selected sample", variant="primary")
-            sample_btn.click(
-                fn=predict_sample,
-                inputs=[sample_dropdown, model_path, feature_combo, img_size, include_surf],
-                outputs=[pred_label, pred_details],
-            )
+        model_path.change(
+            fn=update_feature_combo, inputs=model_path, outputs=feature_combo
+        )
 
         gr.Markdown(
             """
             Notes:
-            - If *Feature combination* is left empty, the app tries to infer it from the model filename.
+            - Feature combination is inferred automatically from the selected model filename.
             - Make sure the model was trained with the same feature extraction settings.
             """
         )
 
     return demo
 
-
 if __name__ == "__main__":
+    print("Warming up default model...")
+    warm_up_default_model(_find_default_model_path())
+    print("Building interface...")
     app = build_interface()
+    print("Launching app...")
     app.launch(server_name="127.0.0.1", server_port=7860)
