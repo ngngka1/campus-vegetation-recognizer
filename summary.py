@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,8 @@ class SummaryData:
     classification_report: dict[str, dict[str, float]]
     confusion_matrix: np.ndarray
     confusion_matrix_normalized: np.ndarray
+    test_confusion_matrix: np.ndarray
+    test_confusion_matrix_normalized: np.ndarray
     confusion_pairs: list[tuple[str, str, int]]
     correct_examples: list[tuple[str, str, str, float]]
     incorrect_examples: list[tuple[str, str, str, float]]
@@ -87,6 +90,15 @@ def write_examples_csv(path: Path, rows: list[tuple[str, str, str, float]]) -> N
         writer = csv.writer(f)
         writer.writerow(["image_path", "true_label", "pred_label", "confidence"])
         writer.writerows(rows)
+
+
+def normalize_confusion_matrix(cm: np.ndarray) -> np.ndarray:
+    return cm.astype(np.float64) / np.clip(cm.sum(axis=1, keepdims=True), a_min=1, a_max=None)
+
+
+def pipeline_slug(result: TrainResult) -> str:
+    raw = f"{result.model_name}_{result.feature_name}".lower()
+    return re.sub(r"[^a-z0-9]+", "_", raw).strip("_")
 
 
 def write_report(
@@ -169,8 +181,14 @@ def write_report(
                 f"support={int(metrics['support'])}"
             )
         lines.append(
-            "- Confusion matrix (validation split) is saved to `confusion_matrix_val.csv` "
-            "and row-normalized version to `confusion_matrix_val_normalized.csv`."
+            "- Top-3 validation confusion matrices are saved as "
+            "`confusion_matrix_top{rank}_val_<pipeline>.csv` and "
+            "`confusion_matrix_top{rank}_val_normalized_<pipeline>.csv`."
+        )
+        lines.append(
+            "- Top-3 test confusion matrices are saved as "
+            "`confusion_matrix_top{rank}_test_<pipeline>.csv` and "
+            "`confusion_matrix_top{rank}_test_normalized_<pipeline>.csv`."
         )
     else:
         lines.append(
@@ -218,6 +236,10 @@ def write_traditional_ml_outputs(
     confusion matrices, examples, etc.).
     """
     output_dir = Path(run_data.output_dir)
+    # clean the output directory
+    for file in output_dir.glob("*"):
+        if file.is_file():
+            file.unlink()
     dataset_dir = Path(run_data.dataset_dir)
     seed = run_data.seed
     train_results: list[TrainResult] = run_data.train_results
@@ -225,7 +247,8 @@ def write_traditional_ml_outputs(
     split = run_data.split
     val_idx_for_eval = np.asarray(run_data.val_idx_for_eval, dtype=np.int64)
 
-    best = train_results[0]
+    top_results = train_results[: min(3, len(train_results))]
+    best = top_results[0]
     test_acc = float(best.test_accuracy)
     report_dict: dict[str, dict[str, float]] = {}
     confusion_pairs: list[tuple[str, str, int]] = []
@@ -233,6 +256,8 @@ def write_traditional_ml_outputs(
     wrong_rows: list[tuple[str, str, str, float]] = []
     cm = np.zeros((0, 0), dtype=np.int64)
     cm_norm = np.zeros((0, 0), dtype=np.float64)
+    cm_test = np.zeros((0, 0), dtype=np.int64)
+    cm_test_norm = np.zeros((0, 0), dtype=np.float64)
     class_names: list[str] = []
 
     labels_raw = run_data.labels
@@ -242,33 +267,94 @@ def write_traditional_ml_outputs(
         labels_raw is not None
         and feature_sets is not None
         and len(val_idx_for_eval) > 0
+        and top_results
     ):
         labels = np.asarray(labels_raw, dtype=object)
         class_names = sorted(np.unique(labels).tolist())
 
-        best_x = feature_sets[best.feature_name]
+        test_labels_raw = getattr(run_data, "test_labels", None)
+        test_feature_sets = getattr(run_data, "test_feature_sets", None)
+        test_labels = (
+            np.asarray(test_labels_raw, dtype=object)
+            if test_labels_raw is not None
+            else None
+        )
+
         y_val_true = labels[val_idx_for_eval]
-        y_val_pred_raw = best.estimator.predict(best_x[val_idx_for_eval])
-        y_val_pred = np.asarray(y_val_pred_raw, dtype=object)
+        for rank, result in enumerate(top_results, start=1):
+            result_slug = pipeline_slug(result)
+            x_val = feature_sets[result.feature_name]
+            y_val_pred_raw = result.estimator.predict(x_val[val_idx_for_eval])
+            y_val_pred = np.asarray(y_val_pred_raw, dtype=object)
+            cm_val = confusion_matrix(y_val_true, y_val_pred, labels=class_names)
+            cm_val_norm = normalize_confusion_matrix(cm_val)
 
-        y_val_conf = margin_confidence(best.estimator, best_x[val_idx_for_eval])
+            write_confusion_csv(
+                output_dir / f"confusion_matrix_top{rank}_val_{result_slug}.csv",
+                class_names,
+                cm_val,
+            )
+            write_confusion_csv(
+                output_dir
+                / f"confusion_matrix_top{rank}_val_normalized_{result_slug}.csv",
+                class_names,
+                cm_val_norm,
+            )
 
-        report_dict = classification_report(
-            y_val_true,
-            y_val_pred,
-            labels=class_names,
-            output_dict=True,
-            zero_division=0,
-        )
-        cm = confusion_matrix(y_val_true, y_val_pred, labels=class_names)
-        cm_norm = cm.astype(np.float64) / np.clip(
-            cm.sum(axis=1, keepdims=True), a_min=1, a_max=None
-        )
+            if (
+                test_labels is not None
+                and test_feature_sets is not None
+                and result.feature_name in test_feature_sets
+                and len(test_labels) == len(test_feature_sets[result.feature_name])
+            ):
+                x_test = test_feature_sets[result.feature_name]
+                y_test_pred_raw = result.estimator.predict(x_test)
+                y_test_pred = np.asarray(y_test_pred_raw, dtype=object)
+                cm_test_rank = confusion_matrix(test_labels, y_test_pred, labels=class_names)
+                cm_test_norm_rank = normalize_confusion_matrix(cm_test_rank)
+                write_confusion_csv(
+                    output_dir / f"confusion_matrix_top{rank}_test_{result_slug}.csv",
+                    class_names,
+                    cm_test_rank,
+                )
+                write_confusion_csv(
+                    output_dir
+                    / f"confusion_matrix_top{rank}_test_normalized_{result_slug}.csv",
+                    class_names,
+                    cm_test_norm_rank,
+                )
+            else:
+                cm_test_rank = np.zeros((0, 0), dtype=np.int64)
+                cm_test_norm_rank = np.zeros((0, 0), dtype=np.float64)
 
-        write_confusion_csv(output_dir / "confusion_matrix_val.csv", class_names, cm)
-        write_confusion_csv(
-            output_dir / "confusion_matrix_val_normalized.csv", class_names, cm_norm
-        )
+            if rank == 1:
+                y_val_conf = margin_confidence(result.estimator, x_val[val_idx_for_eval])
+                report_dict = classification_report(
+                    y_val_true,
+                    y_val_pred,
+                    labels=class_names,
+                    output_dict=True,
+                    zero_division=0,
+                )
+                cm = cm_val
+                cm_norm = cm_val_norm
+                cm_test = cm_test_rank
+                cm_test_norm = cm_test_norm_rank
+
+                # Backward-compatible filenames for best model artifacts.
+                write_confusion_csv(output_dir / "confusion_matrix_val.csv", class_names, cm)
+                write_confusion_csv(
+                    output_dir / "confusion_matrix_val_normalized.csv", class_names, cm_norm
+                )
+                if cm_test.size:
+                    write_confusion_csv(
+                        output_dir / "confusion_matrix_test.csv", class_names, cm_test
+                    )
+                    write_confusion_csv(
+                        output_dir / "confusion_matrix_test_normalized.csv",
+                        class_names,
+                        cm_test_norm,
+                    )
 
         loaded_dataset_paths = getattr(run_data, "paths", None)
         loaded_dataset_paths_arr = (
@@ -289,7 +375,7 @@ def write_traditional_ml_outputs(
         correct_rows, wrong_rows = pick_examples(
             paths=example_paths[val_idx_for_eval],
             y_true=y_val_true,
-            y_pred=y_val_pred,
+            y_pred=np.asarray(best.estimator.predict(feature_sets[best.feature_name][val_idx_for_eval]), dtype=object),
             confidences=y_val_conf,
         )
         write_examples_csv(
@@ -308,6 +394,7 @@ def write_traditional_ml_outputs(
             "features": r.feature_name,
             "train_accuracy": r.train_accuracy,
             "val_accuracy": r.val_accuracy,
+            "val_folds": r.val_folds,
             "test_accuracy": r.test_accuracy,
             "train_seconds": r.train_seconds,
         }
@@ -316,6 +403,21 @@ def write_traditional_ml_outputs(
     (output_dir / "train_results.json").write_text(
         json.dumps(train_results_payload, indent=2), encoding="utf-8"
     )
+
+    top_pipelines_payload = [
+        {
+            "rank": idx + 1,
+            "model": r.model_name,
+            "features": r.feature_name,
+            "pipeline": f"{r.model_name}: {r.feature_name}",
+            "slug": pipeline_slug(r),
+            "val_confusion_matrix_csv": f"confusion_matrix_top{idx+1}_val_{pipeline_slug(r)}.csv",
+            "val_confusion_matrix_normalized_csv": f"confusion_matrix_top{idx+1}_val_normalized_{pipeline_slug(r)}.csv",
+            "test_confusion_matrix_csv": f"confusion_matrix_top{idx+1}_test_{pipeline_slug(r)}.csv",
+            "test_confusion_matrix_normalized_csv": f"confusion_matrix_top{idx+1}_test_normalized_{pipeline_slug(r)}.csv",
+        }
+        for idx, r in enumerate(top_results)
+    ]
 
     summary_payload = {
         "dataset_dir": str(dataset_dir) if dataset_dir is not None else "N/A",
@@ -330,6 +432,7 @@ def write_traditional_ml_outputs(
         },
         "best_pipeline": f"{best.model_name}: {best.feature_name}",
         "test_accuracy": test_acc,
+        "top_pipelines": top_pipelines_payload,
     }
     (output_dir / "run_summary.json").write_text(
         json.dumps(summary_payload, indent=2), encoding="utf-8"
@@ -352,6 +455,8 @@ def write_traditional_ml_outputs(
         classification_report=report_dict,
         confusion_matrix=cm,
         confusion_matrix_normalized=cm_norm,
+        test_confusion_matrix=cm_test,
+        test_confusion_matrix_normalized=cm_test_norm,
         confusion_pairs=confusion_pairs,
         correct_examples=correct_rows,
         incorrect_examples=wrong_rows,

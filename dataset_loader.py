@@ -15,7 +15,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-
+from sklearn.decomposition import PCA
 
 from data_augmentation import IMAGE_SUFFIXES, infer_source_group
 from feature_extractor import (
@@ -40,12 +40,15 @@ class PipelineConfig:
     data_root: Path
     dataset_subdir: str = "auto"
     output_dir: Path | None = None
-    seed: int = 42  
+    seed: int = 42
     img_size: int = 128
     max_examples_per_group: int = 99999
     show_progress: bool = True
     feature_combinations: tuple[str, ...] | None = None
     include_surf_if_available: bool = False
+    # If set, reduce each base feature block to this many components via PCA.
+    # Set to None to disable. Helps balance dimensionality when concatenating.
+    pca_per_block: int | None = 50
 
 
 @dataclass(frozen=True)
@@ -181,6 +184,71 @@ def extract_base_feature_sets(
         except RuntimeError:
             pass
     return base
+
+
+def reduce_base_features_with_pca(
+    base_features: dict[str, np.ndarray],
+    n_components: int = 50,
+    *,
+    fitted_pcas: dict[str, PCA] | None = None,
+    random_state: int | None = None,
+) -> tuple[dict[str, np.ndarray], dict[str, PCA]]:
+    """
+    Apply PCA to each base feature block to balance dimensionality.
+
+    Use this before concatenation to prevent high-dimensional blocks (e.g. color_hist
+    with 768 dims) from dominating distance-based models. Each block is reduced to
+    n_components dimensions (or fewer if the block has fewer original dimensions).
+
+    Args:
+        base_features: Dict of feature_name -> (n_samples, n_dims).
+        n_components: Target number of components per block. Blocks with fewer
+            original dimensions are left unchanged.
+        fitted_pcas: If provided, use these fitted PCA objects for transform only
+            (no fit). Use when processing test/inference data.
+        random_state: Random state for PCA reproducibility.
+
+    Returns:
+        (reduced_base_features, fitted_pcas). The fitted PCAs can be passed back
+        as fitted_pcas when processing another dataset (e.g. test set).
+
+    Example:
+        # Training:
+        train_base = extract_base_feature_sets(train_images, ...)
+        train_reduced, pcas = reduce_base_features_with_pca(train_base, n_components=50)
+        train_feature_sets = build_feature_sets(..., base_features=train_reduced)
+
+        # Test/inference:
+        test_base = extract_base_feature_sets(test_images, ...)
+        test_reduced, _ = reduce_base_features_with_pca(test_base, fitted_pcas=pcas)
+        test_feature_sets = build_feature_sets(..., base_features=test_reduced)
+    """
+    reduced: dict[str, np.ndarray] = {}
+    pcas_out: dict[str, PCA] = {}
+
+    for name, arr in base_features.items():
+        arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+        n_dims = arr.shape[1]
+        effective_components = min(n_components, n_dims)
+
+        if fitted_pcas is not None:
+            if name in fitted_pcas:
+                pca = fitted_pcas[name]
+                reduced[name] = pca.transform(arr).astype(np.float32)
+                pcas_out[name] = pca
+            else:
+                # Block was passed through during training (n_dims <= n_components)
+                reduced[name] = arr
+        elif effective_components < n_dims:
+            pca = PCA(n_components=effective_components, random_state=random_state)
+            reduced[name] = pca.fit_transform(arr).astype(np.float32)
+            pcas_out[name] = pca
+        else:
+            # Block has fewer dims than n_components; pass through unchanged
+            reduced[name] = arr
+            # No PCA fitted; test data for this block will also pass through
+
+    return reduced, pcas_out
 
 
 def build_feature_sets(
