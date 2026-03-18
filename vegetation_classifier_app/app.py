@@ -15,13 +15,18 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from dataset_loader import build_feature_sets  # noqa: E402
+from dataset_loader import (  # noqa: E402
+    build_feature_sets,
+    extract_base_feature_sets,
+    reduce_base_features_with_pca,
+)
 
 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}
 KNOWN_MODELS = ("random_forest", "svm", "knn")
 MODEL_SUFFIXES = {".pkl", ".joblib"}
 _MODEL_CACHE: dict[str, object] = {}
+_PCAS_CACHE: dict[str, object | None] = {}
 DEFAULT_IMG_SIZE = 128
 DEFAULT_INCLUDE_SURF = False
 
@@ -92,6 +97,40 @@ def _feature_combo_for_model(model_path: str) -> str:
     return combo
 
 
+def _get_pcas_for_model(model_path: str) -> object | None:
+    """Load fitted PCAs if the model was trained with PCA per block."""
+    models_dir = Path(model_path).expanduser().parent
+    pcas_file = models_dir / "pcas.joblib"
+    cache_key = str(models_dir.resolve())
+    if cache_key not in _PCAS_CACHE:
+        _PCAS_CACHE[cache_key] = load(pcas_file) if pcas_file.exists() else None
+    return _PCAS_CACHE[cache_key]
+
+
+def _build_features_for_inference(
+    image_bgr: np.ndarray,
+    feature_combo: str,
+    img_size: int = DEFAULT_IMG_SIZE,
+    fitted_pcas: object | None = None,
+) -> np.ndarray:
+    """Build features for inference, applying PCA if the model was trained with it."""
+    base = extract_base_feature_sets(
+        [image_bgr],
+        img_size=img_size,
+        include_surf_if_available=DEFAULT_INCLUDE_SURF,
+    )
+    if fitted_pcas is not None:
+        base, _ = reduce_base_features_with_pca(base, fitted_pcas=fitted_pcas)
+    feature_sets = build_feature_sets(
+        [image_bgr],
+        img_size=img_size,
+        feature_combinations=(feature_combo,),
+        include_surf_if_available=DEFAULT_INCLUDE_SURF,
+        base_features=base,
+    )
+    return feature_sets[feature_combo]
+
+
 def _predict_from_bgr(
     image_bgr: np.ndarray,
     model_path: str,
@@ -101,13 +140,13 @@ def _predict_from_bgr(
         raise FileNotFoundError(f"Model file does not exist: {model_file}")
     cleaned_feature_combo = _feature_combo_for_model(model_path)
     model = _get_cached_model(model_file)
-    feature_sets = build_feature_sets(
-        [image_bgr],
+    fitted_pcas = _get_pcas_for_model(model_path)
+    x = _build_features_for_inference(
+        image_bgr,
+        cleaned_feature_combo,
         img_size=DEFAULT_IMG_SIZE,
-        feature_combinations=(cleaned_feature_combo,),
-        include_surf_if_available=DEFAULT_INCLUDE_SURF,
+        fitted_pcas=fitted_pcas,
     )
-    x = feature_sets[cleaned_feature_combo]
     pred = model.predict(x)[0]
 
     details = [
@@ -196,14 +235,15 @@ def warm_up_default_model(default_model_path: str, img_size: int = 128) -> None:
         model_file = Path(default_model_path).expanduser()
         _get_cached_model(model_file)
         combo = _feature_combo_for_model(default_model_path)
+        fitted_pcas = _get_pcas_for_model(default_model_path)
         dummy = np.zeros((img_size, img_size, 3), dtype=np.uint8)
-        features = build_feature_sets(
-            [dummy],
+        features = _build_features_for_inference(
+            dummy,
+            combo,
             img_size=img_size,
-            feature_combinations=(combo,),
-            include_surf_if_available=False,
+            fitted_pcas=fitted_pcas,
         )
-        _MODEL_CACHE[str(model_file.resolve())].predict(features[combo])
+        _MODEL_CACHE[str(model_file.resolve())].predict(features)
     except Exception as exc:
         print(f"[WARN] Startup warm-up skipped: {exc}")
 
