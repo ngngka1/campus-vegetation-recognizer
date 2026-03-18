@@ -7,6 +7,7 @@ from typing import Protocol
 import numpy as np
 from sklearn.base import clone
 from sklearn.metrics import accuracy_score
+from sklearn.model_selection import StratifiedKFold
 
 import random
 from pathlib import Path
@@ -83,59 +84,115 @@ def train_candidates(
         for model_name in model_factories.keys()
     ]
 
+    # Use all available labeled training samples for CV, while keeping the same
+    # function contract for callers.
+    cv_pool_idx = np.concatenate([split.train, split.val]).astype(np.int64)
+    if cv_pool_idx.size == 0:
+        raise ValueError("No samples available for training/cross-validation.")
+
+    cv_pool_labels = train_labels[cv_pool_idx]
+    unique_labels, label_counts = np.unique(cv_pool_labels, return_counts=True)
+    if unique_labels.size < 2:
+        raise ValueError(
+            "Training data contains fewer than 2 classes after preprocessing/augmentation. "
+            "Please adjust split settings or data sampling."
+        )
+
+    # Prefer 5-fold CV, but adapt to small datasets safely.
+    preferred_folds = 5
+    max_possible_folds = int(label_counts.min())
+    n_folds = min(preferred_folds, max_possible_folds)
+    use_cv = n_folds >= 2
+
     results: list[TrainResult] = []
     bar = _pair_progress_bar(len(candidates)) if show_progress else None
     for model_name, feature_name in candidates:
-        estimator = clone(model_factories[model_name])
-        # get the feature for the images for index split.train
-        x_train = train_feature_sets[feature_name][split.train]
-        x_train = np.nan_to_num(
-            x_train,
+        # Build the full train pool once and evaluate via CV folds.
+        x_pool = train_feature_sets[feature_name][cv_pool_idx]
+        x_pool = np.nan_to_num(
+            x_pool,
             nan=0.0,
             posinf=0.0,
             neginf=0.0,
         ).astype(np.float32)
-        # get the label for the images for index split.train
-        y_train = train_labels[split.train]
-        if np.unique(y_train).size < 2:
-            raise ValueError(
-                "Training split contains fewer than 2 classes after preprocessing/augmentation. "
-                "Please adjust split settings or data sampling."
-            )
-        # get the feature for the images for index split.val
-        x_val = train_feature_sets[feature_name][split.val]
-        x_val = np.nan_to_num(
-            x_val,
-            nan=0.0,
-            posinf=0.0,
-            neginf=0.0,
-        ).astype(np.float32)
-        # get the label for the images for index split.val
-        y_val = train_labels[split.val]
+        y_pool = cv_pool_labels
         if bar is not None:
             bar.set_description(f"Training [{model_name} | {feature_name}]")
-        t0 = time.perf_counter()
+        cv_train_scores: list[float] = []
+        cv_val_scores: list[float] = []
+        cv_fit_seconds = 0.0
 
-        estimator.fit(x_train, y_train)
+        if use_cv:
+            splitter = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
+            for fold_train_idx, fold_val_idx in splitter.split(x_pool, y_pool):
+                fold_estimator = clone(model_factories[model_name])
+                x_fold_train = x_pool[fold_train_idx]
+                y_fold_train = y_pool[fold_train_idx]
+                x_fold_val = x_pool[fold_val_idx]
+                y_fold_val = y_pool[fold_val_idx]
 
-        train_seconds = time.perf_counter() - t0
+                t0 = time.perf_counter()
+                fold_estimator.fit(x_fold_train, y_fold_train)
+                cv_fit_seconds += time.perf_counter() - t0
 
-        # predict for training set
-        y_train_pred = estimator.predict(x_train)
-        # predict for validation set
-        y_val_pred = estimator.predict(x_val)
+                y_fold_train_pred = fold_estimator.predict(x_fold_train)
+                y_fold_val_pred = fold_estimator.predict(x_fold_val)
+                cv_train_scores.append(float(accuracy_score(y_fold_train, y_fold_train_pred)))
+                cv_val_scores.append(float(accuracy_score(y_fold_val, y_fold_val_pred)))
+        else:
+            # Fallback for very small data where CV is not feasible.
+            if split.train.size == 0:
+                raise ValueError("Training split is empty and CV cannot be formed.")
+            x_train = train_feature_sets[feature_name][split.train]
+            x_train = np.nan_to_num(
+                x_train,
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            ).astype(np.float32)
+            y_train = train_labels[split.train]
+            if np.unique(y_train).size < 2:
+                raise ValueError(
+                    "Training split contains fewer than 2 classes after preprocessing/augmentation. "
+                    "Please adjust split settings or data sampling."
+                )
+            x_val = train_feature_sets[feature_name][split.val]
+            x_val = np.nan_to_num(
+                x_val,
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            ).astype(np.float32)
+            y_val = train_labels[split.val]
 
-        train_acc = float(accuracy_score(y_train, y_train_pred))
-        val_acc = float(accuracy_score(y_val, y_val_pred))
+            fold_estimator = clone(model_factories[model_name])
+            t0 = time.perf_counter()
+            fold_estimator.fit(x_train, y_train)
+            cv_fit_seconds = time.perf_counter() - t0
+            cv_train_scores.append(float(accuracy_score(y_train, fold_estimator.predict(x_train))))
+            if y_val.size > 0:
+                cv_val_scores.append(float(accuracy_score(y_val, fold_estimator.predict(x_val))))
+            else:
+                cv_val_scores.append(cv_train_scores[-1])
+
+        train_acc = float(np.mean(cv_train_scores))
+        val_acc = float(np.mean(cv_val_scores))
+        train_seconds = cv_fit_seconds
+
+        # Fit a final model on the full train pool used by CV for test evaluation/saving.
+        estimator = clone(model_factories[model_name])
+        estimator.fit(x_pool, y_pool)
 
         # finally, predict for test set and calculate accuracy
         y_test_pred = estimator.predict(test_feature_sets[feature_name])
         test_acc = float(accuracy_score(test_labels, y_test_pred))
 
         if show_progress:
+            val_folds_str = ", ".join(f"{score:.4f}" for score in cv_val_scores)
             log_line = (
                 f"[{model_name} | {feature_name}] \n"
-                f"test_acc={test_acc:.4f}, val_acc={val_acc:.4f}, train_acc={train_acc:.4f}, time={train_seconds:.1f}s"
+                f"test_acc={test_acc:.4f}, val_acc={val_acc:.4f}, "
+                f"val_folds=[{val_folds_str}], train_acc={train_acc:.4f}, time={train_seconds:.1f}s"
             )
             if tqdm is not None:
                 tqdm.write(log_line)
@@ -231,7 +288,6 @@ def run_traditional_ml_pipeline(
     rng.shuffle(val_idx_for_eval)
     split = DatasetSplit(train=train_idx_for_fit, val=val_idx_for_eval)
 
-    class_names = sorted(np.unique(train_labels).tolist())
     train_class_counts = _count_labels(train_labels)
 
     print("[INFO] Per-class sample size before training (full collected dataset):")
