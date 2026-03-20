@@ -6,6 +6,7 @@ from typing import Protocol
 
 import numpy as np
 from sklearn.base import clone
+from sklearn.decomposition import PCA
 from sklearn.metrics import accuracy_score
 from sklearn.model_selection import StratifiedKFold
 
@@ -17,7 +18,9 @@ from dataset_loader import (
     PipelineConfig,
     PipelineDataset,
     build_feature_sets,
-    extract_base_feature_sets,
+    concat_feature_combo,
+    fit_pcas_on_indices,
+    reduce_base_features_with_pca,
 )
 
 try:
@@ -48,6 +51,7 @@ class MLPipelineOutput:
     output_dir: Path
     seed: int
     split: SplitLike
+    fitted_pcas: dict[str, PCA] | None = None
 
 
 @dataclass
@@ -62,6 +66,14 @@ class TrainResult:
     estimator: object
 
 
+@dataclass
+class TrainCandidatesOutput:
+    """From train_candidates: CV metrics and, when PCA is used, one PCA dict fit on full CV pool."""
+
+    results: list[TrainResult]
+    fitted_pcas_full_cv: dict[str, PCA] | None = None
+
+
 def _pair_progress_bar(total_pairs: int):
     if tqdm is None:
         return None
@@ -74,13 +86,42 @@ def _pair_progress_bar(total_pairs: int):
 
 
 def train_candidates(
-    train_feature_sets: dict[str, np.ndarray],
     train_labels: np.ndarray,
     split: SplitLike,
     *,
     seed: int,
     show_progress: bool = True,
-) -> list[TrainResult]:
+    train_feature_sets: dict[str, np.ndarray] | None = None,
+    train_base_features: dict[str, np.ndarray] | None = None,
+    feature_combinations: tuple[str, ...] | None = None,
+    pca_n_components: int | None = None,
+    pca_features_to_reduce: list[str] | None = None,
+    fitted_pcas_full_pool: dict[str, PCA] | None = None,
+    test_labels: np.ndarray | None = None,
+    test_feature_sets: dict[str, np.ndarray] | None = None,
+    test_base_features: dict[str, np.ndarray] | None = None,
+) -> TrainCandidatesOutput:
+    if pca_n_components is not None:
+        if train_base_features is None or feature_combinations is None:
+            raise ValueError(
+                "When pca_n_components is set, train_base_features and feature_combinations are required."
+            )
+        return _train_candidates_pca_per_fold(
+            train_base_features=train_base_features,
+            feature_combinations=feature_combinations,
+            train_labels=train_labels,
+            split=split,
+            pca_n_components=pca_n_components,
+            pca_features_to_reduce=pca_features_to_reduce,
+            seed=seed,
+            show_progress=show_progress,
+            fitted_pcas_full_pool=fitted_pcas_full_pool,
+            test_labels=test_labels,
+            test_base_features=test_base_features,
+        )
+
+    if train_feature_sets is None:
+        raise ValueError("train_feature_sets is required when pca_n_components is None.")
     model_factories = build_model_factories(seed=seed)
     candidates = [
         (model_name, feature_name)
@@ -110,6 +151,7 @@ def train_candidates(
 
     results: list[TrainResult] = []
     bar = _pair_progress_bar(len(candidates)) if show_progress else None
+    test_features_cache: dict[str, np.ndarray] = {}
     for model_name, feature_name in candidates:
         # Build the full train pool once and evaluate via CV folds.
         x_pool = train_feature_sets[feature_name][cv_pool_idx]
@@ -187,11 +229,30 @@ def train_candidates(
         estimator = clone(model_factories[model_name])
         estimator.fit(x_pool, y_pool)
 
+        if test_labels is not None and test_feature_sets is not None:
+            if feature_name not in test_features_cache:
+                test_features_cache[feature_name] = np.nan_to_num(
+                    test_feature_sets[feature_name],
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                ).astype(np.float32)
+            y_test_pred = estimator.predict(test_features_cache[feature_name])
+            test_accuracy = float(accuracy_score(test_labels, y_test_pred))
+        else:
+            test_accuracy = float("nan")
+
         if show_progress:
             val_folds_str = ", ".join(f"{score:.4f}" for score in cv_val_scores)
             log_line = (
                 f"[{model_name} | {feature_name}] \n"
                 f"val_acc={val_acc:.4f}, "
+                f"val_folds=[{val_folds_str}], train_acc={train_acc:.4f}, time={train_seconds:.1f}s"
+            )
+            if test_labels is not None and test_feature_sets is not None:
+                log_line = (
+                f"[{model_name} | {feature_name}] \n"
+                f"test_acc={test_accuracy:.4f}, val_acc={val_acc:.4f}, "
                 f"val_folds=[{val_folds_str}], train_acc={train_acc:.4f}, time={train_seconds:.1f}s"
             )
             if tqdm is not None:
@@ -209,14 +270,236 @@ def train_candidates(
                 train_accuracy=train_acc,
                 train_seconds=train_seconds,
                 estimator=estimator,
-                test_accuracy=float("nan"),
+                test_accuracy=test_accuracy,
             )
         )
     if bar is not None:
         bar.close()
     # Rank candidates by CV metrics only (primary: val, secondary: train).
     results.sort(key=lambda r: (r.val_accuracy, r.train_accuracy), reverse=True)
-    return results
+    return TrainCandidatesOutput(results=results, fitted_pcas_full_cv=None)
+
+
+def _train_candidates_pca_per_fold(
+    train_base_features: dict[str, np.ndarray],
+    feature_combinations: tuple[str, ...],
+    train_labels: np.ndarray,
+    split: SplitLike,
+    *,
+    pca_n_components: int,
+    pca_features_to_reduce: list[str] | None,
+    seed: int,
+    show_progress: bool,
+    fitted_pcas_full_pool: dict[str, PCA] | None = None,
+    test_labels: np.ndarray | None = None,
+    test_base_features: dict[str, np.ndarray] | None = None,
+) -> TrainCandidatesOutput:
+    """Cross-validate classifiers with PCA refit on each fold's training indices; final model uses one PCA fit on full CV pool.
+
+    If ``fitted_pcas_full_pool`` is provided, it must be PCA fit on the same row set as
+    ``concatenate(split.train, split.val)`` (the CV pool), not on train split alone.
+    """
+    model_factories = build_model_factories(seed=seed)
+    combos = sorted({c.strip().lower() for c in feature_combinations if c.strip()})
+    candidates = [(model_name, fn) for fn in combos for model_name in model_factories.keys()]
+
+    cv_pool_idx = np.concatenate([split.train, split.val]).astype(np.int64)
+    if cv_pool_idx.size == 0:
+        raise ValueError("No samples available for training/cross-validation.")
+
+    cv_pool_labels = train_labels[cv_pool_idx]
+    unique_labels, label_counts = np.unique(cv_pool_labels, return_counts=True)
+    if unique_labels.size < 2:
+        raise ValueError(
+            "Training data contains fewer than 2 classes after preprocessing/augmentation. "
+            "Please adjust split settings or data sampling."
+        )
+
+    preferred_folds = 5
+    max_possible_folds = int(label_counts.min())
+    n_folds = min(preferred_folds, max_possible_folds)
+    use_cv = n_folds >= 2
+
+    if fitted_pcas_full_pool is not None:
+        fitted_pcas_full_cv = fitted_pcas_full_pool
+    else:
+        fitted_pcas_full_cv = fit_pcas_on_indices(
+            train_base_features,
+            cv_pool_idx,
+            pca_n_components,
+            features_to_reduce=pca_features_to_reduce,
+            random_state=seed,
+        )
+
+    results: list[TrainResult] = []
+    bar = _pair_progress_bar(len(candidates)) if show_progress else None
+    pca_test_features_cache: dict[str, np.ndarray] = {}
+
+    for model_name, feature_name in candidates:
+        if bar is not None:
+            bar.set_description(f"Training [{model_name} | {feature_name}]")
+        cv_train_scores: list[float] = []
+        cv_val_scores: list[float] = []
+        cv_fit_seconds = 0.0
+
+        if use_cv:
+            splitter = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
+            for fold_train_idx, fold_val_idx in splitter.split(cv_pool_idx, cv_pool_labels):
+                train_rows = cv_pool_idx[fold_train_idx]
+                val_rows = cv_pool_idx[fold_val_idx]
+                fitted_fold = fit_pcas_on_indices(
+                    train_base_features,
+                    train_rows,
+                    pca_n_components,
+                    features_to_reduce=pca_features_to_reduce,
+                    random_state=seed,
+                )
+                x_fold_train = concat_feature_combo(
+                    train_base_features,
+                    feature_name,
+                    train_rows,
+                    fitted_fold,
+                    pca_n_components,
+                    features_to_reduce=pca_features_to_reduce,
+                )
+                x_fold_val = concat_feature_combo(
+                    train_base_features,
+                    feature_name,
+                    val_rows,
+                    fitted_fold,
+                    pca_n_components,
+                    features_to_reduce=pca_features_to_reduce,
+                )
+                y_fold_train = train_labels[train_rows]
+                y_fold_val = train_labels[val_rows]
+
+                fold_estimator = clone(model_factories[model_name])
+                t0 = time.perf_counter()
+                fold_estimator.fit(x_fold_train, y_fold_train)
+                cv_fit_seconds += time.perf_counter() - t0
+
+                cv_train_scores.append(
+                    float(accuracy_score(y_fold_train, fold_estimator.predict(x_fold_train)))
+                )
+                cv_val_scores.append(
+                    float(accuracy_score(y_fold_val, fold_estimator.predict(x_fold_val)))
+                )
+        else:
+            if split.train.size == 0:
+                raise ValueError("Training split is empty and CV cannot be formed.")
+            train_rows = split.train.astype(np.int64)
+            val_rows = split.val.astype(np.int64)
+            fitted_once = fit_pcas_on_indices(
+                train_base_features,
+                train_rows,
+                pca_n_components,
+                features_to_reduce=pca_features_to_reduce,
+                random_state=seed,
+            )
+            x_train = concat_feature_combo(
+                train_base_features,
+                feature_name,
+                train_rows,
+                fitted_once,
+                pca_n_components,
+                features_to_reduce=pca_features_to_reduce,
+            )
+            x_val = concat_feature_combo(
+                train_base_features,
+                feature_name,
+                val_rows,
+                fitted_once,
+                pca_n_components,
+                features_to_reduce=pca_features_to_reduce,
+            )
+            y_train = train_labels[train_rows]
+            y_val = train_labels[val_rows]
+            if np.unique(y_train).size < 2:
+                raise ValueError(
+                    "Training split contains fewer than 2 classes after preprocessing/augmentation. "
+                    "Please adjust split settings or data sampling."
+                )
+            fold_estimator = clone(model_factories[model_name])
+            t0 = time.perf_counter()
+            fold_estimator.fit(x_train, y_train)
+            cv_fit_seconds = time.perf_counter() - t0
+            cv_train_scores.append(float(accuracy_score(y_train, fold_estimator.predict(x_train))))
+            if y_val.size > 0:
+                cv_val_scores.append(float(accuracy_score(y_val, fold_estimator.predict(x_val))))
+            else:
+                cv_val_scores.append(cv_train_scores[-1])
+
+        train_acc = float(np.mean(cv_train_scores))
+        val_acc = float(np.mean(cv_val_scores))
+        train_seconds = cv_fit_seconds
+
+        x_pool = concat_feature_combo(
+            train_base_features,
+            feature_name,
+            cv_pool_idx,
+            fitted_pcas_full_cv,
+            pca_n_components,
+            features_to_reduce=pca_features_to_reduce,
+        )
+        y_pool = cv_pool_labels
+        estimator = clone(model_factories[model_name])
+        estimator.fit(x_pool, y_pool)
+
+        if test_labels is not None and test_base_features is not None:
+            if feature_name not in pca_test_features_cache:
+                n_test = int(next(iter(test_base_features.values())).shape[0])
+                test_rows = np.arange(n_test, dtype=np.int64)
+                x_test = concat_feature_combo(
+                    test_base_features,
+                    feature_name,
+                    test_rows,
+                    fitted_pcas_full_cv,
+                    pca_n_components,
+                    features_to_reduce=pca_features_to_reduce,
+                )
+                pca_test_features_cache[feature_name] = np.nan_to_num(
+                    x_test,
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                ).astype(np.float32)
+            y_test_pred = estimator.predict(pca_test_features_cache[feature_name])
+            test_accuracy = float(accuracy_score(test_labels, y_test_pred))
+        else:
+            test_accuracy = float("nan")
+
+        if show_progress:
+            val_folds_str = ", ".join(f"{score:.4f}" for score in cv_val_scores)
+            log_line = (
+                f"[{model_name} | {feature_name}] \n"
+                f"val_acc={val_acc:.4f}, "
+                f"val_folds=[{val_folds_str}], train_acc={train_acc:.4f}, time={train_seconds:.1f}s"
+            )
+            if test_labels is not None and test_base_features is not None:
+                log_line += f", test_acc={test_accuracy:.4f}"
+            if tqdm is not None:
+                tqdm.write(log_line)
+            else:
+                print(log_line)
+        if bar is not None:
+            bar.update(1)
+        results.append(
+            TrainResult(
+                model_name=model_name,
+                feature_name=feature_name,
+                val_accuracy=val_acc,
+                val_folds=cv_val_scores,
+                train_accuracy=train_acc,
+                train_seconds=train_seconds,
+                estimator=estimator,
+                test_accuracy=test_accuracy,
+            )
+        )
+
+    if bar is not None:
+        bar.close()
+    results.sort(key=lambda r: (r.val_accuracy, r.train_accuracy), reverse=True)
+    return TrainCandidatesOutput(results=results, fitted_pcas_full_cv=fitted_pcas_full_cv)
 
 
 def _count_labels(y: np.ndarray) -> dict[str, int]:
@@ -242,6 +525,9 @@ def run_traditional_ml_pipeline(
     save_model: bool = False,
     clean_model_directory: bool = False,
     features_combinations: list[str] | None = None,
+    pca_n_components: int | None = None,
+    pca_features_to_reduce: list[str] | None = None,
+    fitted_pcas_full_pool: dict[str, PCA] | None = None,
 ) -> MLPipelineOutput:
     set_seed(config.seed)
 
@@ -296,45 +582,97 @@ def run_traditional_ml_pipeline(
     for cls in sorted(train_class_counts.keys()):
         print(f"  - {cls}: {train_class_counts[cls]}")
 
-    # Apply PCA per block if enabled (balances dimensionality across feature types)
-    train_feature_sets = build_feature_sets(
-        list(train_images),
-        img_size=config.img_size,
-        feature_combinations=features_combinations,
-        base_features=train_base_features,
-    )
-    test_feature_sets = build_feature_sets(
-        list(test_images),
-        img_size=config.img_size,
-        feature_combinations=features_combinations,
-        base_features=test_base_features,
-    )
-    train_results = train_candidates(
-        train_feature_sets=train_feature_sets,
-        train_labels=train_labels,
-        split=split,
-        seed=config.seed,
-        show_progress=config.show_progress,
-    )
+    if features_combinations is None:
+        raise ValueError("features_combinations is required.")
+    combo_tuple = tuple(features_combinations)
+
+    if pca_n_components is not None:
+        if train_base_features is None or test_base_features is None:
+            raise ValueError(
+                "train_base_features and test_base_features (unreduced) are required when pca_n_components is set."
+            )
+        if fitted_pcas_full_pool is None:
+            cv_pool_idx = np.concatenate([split.train, split.val]).astype(np.int64)
+            fitted_pcas_full_pool = fit_pcas_on_indices(
+                train_base_features,
+                cv_pool_idx,
+                pca_n_components,
+                features_to_reduce=pca_features_to_reduce,
+                random_state=config.seed,
+            )
+        tc_out = train_candidates(
+            train_labels=train_labels,
+            split=split,
+            seed=config.seed,
+            show_progress=config.show_progress,
+            train_base_features=train_base_features,
+            feature_combinations=combo_tuple,
+            pca_n_components=pca_n_components,
+            pca_features_to_reduce=pca_features_to_reduce,
+            fitted_pcas_full_pool=fitted_pcas_full_pool,
+            test_labels=test_labels,
+            test_base_features=test_base_features,
+        )
+        train_results = tc_out.results
+        fitted_pcas = tc_out.fitted_pcas_full_cv
+        if fitted_pcas is None:
+            raise RuntimeError("Expected fitted PCAs from PCA CV path.")
+        train_reduced, _ = reduce_base_features_with_pca(
+            train_base_features,
+            n_components=pca_n_components,
+            features_to_reduce=pca_features_to_reduce,
+            fitted_pcas=fitted_pcas,
+            random_state=config.seed,
+        )
+        test_reduced, _ = reduce_base_features_with_pca(
+            test_base_features,
+            n_components=pca_n_components,
+            features_to_reduce=pca_features_to_reduce,
+            fitted_pcas=fitted_pcas,
+            random_state=config.seed,
+        )
+        train_feature_sets = build_feature_sets(
+            list(train_images),
+            img_size=config.img_size,
+            feature_combinations=features_combinations,
+            base_features=train_reduced,
+        )
+        test_feature_sets = build_feature_sets(
+            list(test_images),
+            img_size=config.img_size,
+            feature_combinations=features_combinations,
+            base_features=test_reduced,
+        )
+    else:
+        fitted_pcas = None
+        train_feature_sets = build_feature_sets(
+            list(train_images),
+            img_size=config.img_size,
+            feature_combinations=features_combinations,
+            base_features=train_base_features,
+        )
+        test_feature_sets = build_feature_sets(
+            list(test_images),
+            img_size=config.img_size,
+            feature_combinations=features_combinations,
+            base_features=test_base_features,
+        )
+        tc_out = train_candidates(
+            train_feature_sets=train_feature_sets,
+            train_labels=train_labels,
+            split=split,
+            seed=config.seed,
+            show_progress=config.show_progress,
+            test_labels=test_labels,
+            test_feature_sets=test_feature_sets,
+        )
+        train_results = tc_out.results
+
     if not train_results:
         raise ValueError("No train results produced for model selection.")
 
-    # Evaluate held-out test accuracy for all CV-ranked candidates, without
-    # changing selection order (which remains CV-based). This is just
-    # for reporting purposes, to show how robust the model is in
-    # scenarios for recognizing vegetations outside the campus
-    test_features_cache: dict[str, np.ndarray] = {}
-    for result in train_results:
-        if result.feature_name not in test_features_cache:
-            test_features_cache[result.feature_name] = np.nan_to_num(
-                test_feature_sets[result.feature_name],
-                nan=0.0,
-                posinf=0.0,
-                neginf=0.0,
-            ).astype(np.float32)
-        y_test_pred = result.estimator.predict(test_features_cache[result.feature_name])
-        result.test_accuracy = float(accuracy_score(test_labels, y_test_pred))
-        
+    # Test accuracy is computed inside train_candidates after each final fit
+    # (held-out test; selection order remains CV-based).
     train_results_sorted_by_test_accuracy = sorted(train_results, key=lambda x: x.test_accuracy, reverse=True)
 
     train_results_by_model: dict[str, list[TrainResult]] = {}
@@ -386,4 +724,5 @@ def run_traditional_ml_pipeline(
         split=split,
         train_idx_for_fit=train_idx_for_fit,
         val_idx_for_eval=val_idx_for_eval,
+        fitted_pcas=fitted_pcas,
     )

@@ -44,11 +44,10 @@ class PipelineConfig:
     img_size: int = 128
     max_examples_per_group: int = 99999
     show_progress: bool = True
-    feature_combinations: tuple[str, ...] | None = None
-    include_surf_if_available: bool = False
+    # feature_combinations: tuple[str, ...] | None = None
+    # include_surf_if_available: bool = False
     # If set, reduce each base feature block to this many components via PCA.
     # Set to None to disable. Helps balance dimensionality when concatenating.
-    pca_per_block: int | None = 50
 
 
 @dataclass(frozen=True)
@@ -190,6 +189,7 @@ def reduce_base_features_with_pca(
     base_features: dict[str, np.ndarray],
     n_components: int = 50,
     *,
+    features_to_reduce: list[str] | None = None,
     fitted_pcas: dict[str, PCA] | None = None,
     random_state: int | None = None,
 ) -> tuple[dict[str, np.ndarray], dict[str, PCA]]:
@@ -204,6 +204,9 @@ def reduce_base_features_with_pca(
         base_features: Dict of feature_name -> (n_samples, n_dims).
         n_components: Target number of components per block. Blocks with fewer
             original dimensions are left unchanged.
+        features_to_reduce: If provided, only apply PCA to these feature names.
+            Features not in this list pass through unchanged. If None, all features
+            are eligible for reduction.
         fitted_pcas: If provided, use these fitted PCA objects for transform only
             (no fit). Use when processing test/inference data.
         random_state: Random state for PCA reproducibility.
@@ -213,10 +216,15 @@ def reduce_base_features_with_pca(
         as fitted_pcas when processing another dataset (e.g. test set).
 
     Example:
-        # Training:
+        # Training (reduce all features):
         train_base = extract_base_feature_sets(train_images, ...)
         train_reduced, pcas = reduce_base_features_with_pca(train_base, n_components=50)
         train_feature_sets = build_feature_sets(..., base_features=train_reduced)
+
+        # Training (reduce only specific features):
+        train_reduced, pcas = reduce_base_features_with_pca(
+            train_base, n_components=50, features_to_reduce=["color_hist", "sift"]
+        )
 
         # Test/inference:
         test_base = extract_base_feature_sets(test_images, ...)
@@ -230,6 +238,10 @@ def reduce_base_features_with_pca(
         arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
         n_dims = arr.shape[1]
         effective_components = min(n_components, n_dims)
+
+        if features_to_reduce is not None and name not in features_to_reduce:
+            reduced[name] = arr
+            continue
 
         if fitted_pcas is not None:
             if name in fitted_pcas:
@@ -249,6 +261,80 @@ def reduce_base_features_with_pca(
             # No PCA fitted; test data for this block will also pass through
 
     return reduced, pcas_out
+
+
+def fit_pcas_on_indices(
+    base_features: dict[str, np.ndarray],
+    fit_indices: np.ndarray,
+    n_components: int,
+    *,
+    features_to_reduce: list[str] | None = None,
+    random_state: int | None = None,
+) -> dict[str, PCA]:
+    """
+    Fit one PCA per eligible block using only rows ``fit_indices`` (e.g. CV fold train).
+
+    Skips blocks not listed in ``features_to_reduce`` (when set) and blocks where
+    dimension is already at or below the effective component count.
+    """
+    fitted: dict[str, PCA] = {}
+    n_fit = int(fit_indices.size)
+    for name, arr in base_features.items():
+        arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+        n_dims = arr.shape[1]
+        effective_components = min(n_components, n_dims, max(n_fit, 1))
+        if features_to_reduce is not None and name not in features_to_reduce:
+            continue
+        if effective_components >= n_dims:
+            continue
+        subset = arr[fit_indices]
+        pca = PCA(n_components=effective_components, random_state=random_state)
+        pca.fit(subset)
+        fitted[name] = pca
+    return fitted
+
+
+def concat_feature_combo(
+    base_features: dict[str, np.ndarray],
+    combo: str,
+    row_indices: np.ndarray,
+    fitted_pcas: dict[str, PCA],
+    n_components: int,
+    *,
+    features_to_reduce: list[str] | None = None,
+) -> np.ndarray:
+    """
+    Build one concatenated feature matrix for ``combo`` using pre-fitted PCAs per block.
+
+    Must match the pass-through rules of :func:`reduce_base_features_with_pca`.
+    """
+    parts = [p.strip() for p in combo.split("+") if p.strip()]
+    if not parts:
+        raise ValueError("empty feature combo")
+    chunks: list[np.ndarray] = []
+    for p in parts:
+        if p not in base_features:
+            raise KeyError(f"Unknown base feature block: {p}")
+        arr = np.nan_to_num(base_features[p], nan=0.0, posinf=0.0, neginf=0.0).astype(
+            np.float32
+        )
+        n_dims = arr.shape[1]
+        effective_components = min(n_components, n_dims)
+        sub = arr[row_indices]
+
+        if features_to_reduce is not None and p not in features_to_reduce:
+            chunks.append(sub)
+            continue
+        if p in fitted_pcas:
+            chunks.append(fitted_pcas[p].transform(arr[row_indices]).astype(np.float32))
+        elif effective_components >= n_dims:
+            chunks.append(sub)
+        else:
+            raise ValueError(
+                f"Missing fitted PCA for block '{p}' that requires reduction "
+                f"(effective_components={effective_components}, n_dims={n_dims})"
+            )
+    return np.concatenate(chunks, axis=1)
 
 
 def build_feature_sets(
