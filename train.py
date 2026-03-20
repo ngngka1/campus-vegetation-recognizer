@@ -11,7 +11,6 @@ from sklearn.model_selection import StratifiedKFold
 
 import random
 from pathlib import Path
-from joblib import dump
 from model import build_model_factories, save
 from dataset_loader import (
     DatasetSplit,
@@ -19,7 +18,6 @@ from dataset_loader import (
     PipelineDataset,
     build_feature_sets,
     extract_base_feature_sets,
-    reduce_base_features_with_pca,
 )
 
 try:
@@ -37,10 +35,12 @@ class SplitLike(Protocol):
 class MLPipelineOutput:
     train_results: list[TrainResult]
     train_results_by_model: dict[str, list[TrainResult]]
+    train_results_sorted_by_test_accuracy: list[TrainResult]
     labels: np.ndarray
     feature_sets: dict[str, np.ndarray]
     test_labels: np.ndarray
     test_feature_sets: dict[str, np.ndarray]
+    test_paths: np.ndarray | None
     split: DatasetSplit
     train_idx_for_fit: np.ndarray
     val_idx_for_eval: np.ndarray
@@ -241,6 +241,7 @@ def run_traditional_ml_pipeline(
     test_base_features: dict[str, np.ndarray] | None = None,
     save_model: bool = False,
     clean_model_directory: bool = False,
+    features_combinations: list[str] | None = None,
 ) -> MLPipelineOutput:
     set_seed(config.seed)
 
@@ -295,47 +296,17 @@ def run_traditional_ml_pipeline(
     for cls in sorted(train_class_counts.keys()):
         print(f"  - {cls}: {train_class_counts[cls]}")
 
-    # Resolve base features (extract if not provided)
-    if train_base_features is None:
-        train_base_features = extract_base_feature_sets(
-            list(train_images),
-            img_size=config.img_size,
-            include_surf_if_available=config.include_surf_if_available,
-        )
-    if test_base_features is None:
-        test_base_features = extract_base_feature_sets(
-            list(test_images),
-            img_size=config.img_size,
-            include_surf_if_available=config.include_surf_if_available,
-        )
-
     # Apply PCA per block if enabled (balances dimensionality across feature types)
-    fitted_pcas: dict | None = None
-    if config.pca_per_block is not None:
-        train_base_features, fitted_pcas = reduce_base_features_with_pca(
-            train_base_features,
-            n_components=config.pca_per_block,
-            random_state=config.seed,
-        )
-        test_base_features, _ = reduce_base_features_with_pca(
-            test_base_features,
-            fitted_pcas=fitted_pcas,
-        )
-        if config.show_progress:
-            print(f"[INFO] PCA per block enabled: n_components={config.pca_per_block}")
-
     train_feature_sets = build_feature_sets(
         list(train_images),
         img_size=config.img_size,
-        feature_combinations=config.feature_combinations,
-        include_surf_if_available=config.include_surf_if_available,
+        feature_combinations=features_combinations,
         base_features=train_base_features,
     )
     test_feature_sets = build_feature_sets(
         list(test_images),
         img_size=config.img_size,
-        feature_combinations=config.feature_combinations,
-        include_surf_if_available=config.include_surf_if_available,
+        feature_combinations=features_combinations,
         base_features=test_base_features,
     )
     train_results = train_candidates(
@@ -363,16 +334,11 @@ def run_traditional_ml_pipeline(
             ).astype(np.float32)
         y_test_pred = result.estimator.predict(test_features_cache[result.feature_name])
         result.test_accuracy = float(accuracy_score(test_labels, y_test_pred))
-
-    if config.show_progress:
-        best_result = train_results[0]
-        print(
-            f"[FINAL TEST] [{best_result.model_name} | {best_result.feature_name}] "
-            f"test_acc={best_result.test_accuracy:.4f}"
-        )
+        
+    train_results_sorted_by_test_accuracy = sorted(train_results, key=lambda x: x.test_accuracy, reverse=True)
 
     train_results_by_model: dict[str, list[TrainResult]] = {}
-    for result in train_results:
+    for result in train_results_sorted_by_test_accuracy:
         if result.model_name not in train_results_by_model:
             train_results_by_model[result.model_name] = []
         train_results_by_model[result.model_name].append(result)
@@ -388,10 +354,8 @@ def run_traditional_ml_pipeline(
         else:
             model_save_dir.mkdir(parents=True, exist_ok=True)
         models_to_save = []
-        for _, value in train_results_by_model.items():
-            models_to_save.append(value[0])
-
-        models_to_save.sort(key=lambda x: x.val_accuracy, reverse=True)
+        for model in train_results_sorted_by_test_accuracy:
+            models_to_save.append(model)
 
         for i, top_model in enumerate(models_to_save):
             save(
@@ -399,20 +363,26 @@ def run_traditional_ml_pipeline(
                 model_save_dir / f"{1+i}_{top_model.model_name}_{top_model.feature_name}.pkl",
             )
 
-        # Save fitted PCAs when PCA per block was used (needed for inference)
-        if fitted_pcas is not None:
-            dump(fitted_pcas, model_save_dir / "pcas.joblib")
+            
+
+    test_paths = (
+        np.asarray(test_dataset.paths, dtype=object)
+        if test_dataset is not None and test_dataset.paths is not None
+        else None
+    )
 
     return MLPipelineOutput(
         dataset_dir=config.data_root / config.dataset_subdir,
         output_dir=output_dir,
         train_results=train_results,
         train_results_by_model=train_results_by_model,
+        train_results_sorted_by_test_accuracy=train_results_sorted_by_test_accuracy,
         seed=config.seed,
         labels=train_labels,
         feature_sets=train_feature_sets,
         test_labels=test_labels,
         test_feature_sets=test_feature_sets,
+        test_paths=test_paths,
         split=split,
         train_idx_for_fit=train_idx_for_fit,
         val_idx_for_eval=val_idx_for_eval,

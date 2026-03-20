@@ -16,6 +16,7 @@ def save(model_pipeline: Pipeline, output_path: str | Path) -> Path:
     return path
 
 def build_model_factories(seed: int) -> dict[str, Pipeline]:
+    print("building model factories")
     model_factories: dict[str, Any] = {
         "svm": Pipeline(
             steps=[
@@ -23,8 +24,9 @@ def build_model_factories(seed: int) -> dict[str, Pipeline]:
                 (
                     "clf",
                     SVC(
-                        C=1.0,
+                        C=1.5,
                         kernel="rbf",
+                        gamma="scale",
                         class_weight="balanced",
                         random_state=seed,
                         max_iter=10000,
@@ -33,9 +35,9 @@ def build_model_factories(seed: int) -> dict[str, Pipeline]:
             ]
         ),
         "random_forest": RandomForestClassifier(
-            n_estimators=500,
+            n_estimators=400,
             max_depth=None,
-            min_samples_leaf=1,
+            min_samples_leaf=5,
             class_weight="balanced_subsample",
             random_state=seed,
             n_jobs=-1,
@@ -43,11 +45,11 @@ def build_model_factories(seed: int) -> dict[str, Pipeline]:
     }
     model_factories["knn"] = Pipeline(
         steps=[
-            ("scaler", StandardScaler(with_mean=False)),
+            ("scaler", StandardScaler()),
             (
                 "clf",
                 KNeighborsClassifier(
-                    n_neighbors=5,
+                    n_neighbors=25,
                     weights="distance",
                     metric="minkowski",
                     p=2,

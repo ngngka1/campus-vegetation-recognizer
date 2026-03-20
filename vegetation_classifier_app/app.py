@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 print("Resolving imports...")
 
 import sys
@@ -120,7 +121,7 @@ def _build_features_for_inference(
         include_surf_if_available=DEFAULT_INCLUDE_SURF,
     )
     if fitted_pcas is not None:
-        base, _ = reduce_base_features_with_pca(base, fitted_pcas=fitted_pcas)
+        base, _ = reduce_base_features_with_pca(base, fitted_pcas=fitted_pcas, n_components=400, features_to_reduce=["hog", "color_hist"])
     feature_sets = build_feature_sets(
         [image_bgr],
         img_size=img_size,

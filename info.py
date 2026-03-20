@@ -32,10 +32,19 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+VIDEO_SUFFIXES = {".mov", ".mp4", ".avi", ".mkv", ".webm", ".m4v", ".wmv"}
+IMAGE_SUFFIXES = {".jpeg", ".jpg", ".png", ".bmp", ".webp"}
+
+
 def count_files_with_suffix(folder: Path, suffixes: set[str]) -> int:
     if not folder.exists() or not folder.is_dir():
         return 0
     return sum(1 for p in folder.rglob("*") if p.is_file() and p.suffix.lower() in suffixes)
+
+
+def root_contains_video(root_dir: Path) -> bool:
+    """Return True if root_dir (or any subdir) contains at least one video file."""
+    return count_files_with_suffix(root_dir, VIDEO_SUFFIXES) > 0
 
 
 def resolve_path(p: Path) -> Path:
@@ -63,51 +72,95 @@ def main() -> None:
         print("No class subdirectories found.")
         return
 
-    rows: list[tuple[str, int, int, int, float]] = []
-    total_root = 0
-    total_target = 0
+    has_video = root_contains_video(root_dir)
 
-    for class_name in classes:
-        root_count = count_files_with_suffix(root_dir / class_name, {".jpeg", ".jpg", ".png", ".bmp", ".webp"})
-        target_count = count_files_with_suffix(
-            target_dir / class_name, {".jpeg", ".jpg", ".png", ".bmp", ".webp"}
+    if has_video:
+        rows: list[tuple[str, int, int, int]] = []
+        total_root_videos = 0
+        total_root_jpeg = 0
+        total_target = 0
+
+        for class_name in classes:
+            root_videos = count_files_with_suffix(root_dir / class_name, VIDEO_SUFFIXES)
+            root_jpeg = count_files_with_suffix(root_dir / class_name, {".jpeg", ".jpg"})
+            target_count = count_files_with_suffix(
+                target_dir / class_name, IMAGE_SUFFIXES
+            )
+            rows.append((class_name, root_videos, root_jpeg, target_count))
+            total_root_videos += root_videos
+            total_root_jpeg += root_jpeg
+            total_target += target_count
+
+        name_width = max(len("class"), max(len(name) for name, _, _, _ in rows))
+        videos_width = max(len("videos"), len(str(total_root_videos)))
+        jpeg_width = max(len("jpeg"), len(str(total_root_jpeg)))
+        target_width = max(len("target"), len(str(total_target)))
+
+        header = (
+            f"{'class':<{name_width}}  {'videos':>{videos_width}}  "
+            f"{'jpeg':>{jpeg_width}}  {'target':>{target_width}}"
         )
-        delta = target_count - root_count
-        fold = (target_count / root_count) if root_count > 0 else 0.0
+        divider = "-" * len(header)
 
-        rows.append((class_name, root_count, target_count, delta, fold))
-        total_root += root_count
-        total_target += target_count
-
-    total_delta = total_target - total_root
-    total_fold = (total_target / total_root) if total_root > 0 else 0.0
-
-    name_width = max(len("class"), max(len(name) for name, _, _, _, _ in rows))
-    root_width = max(len("root"), len(str(total_root)))
-    target_width = max(len("target"), len(str(total_target)))
-    delta_width = max(len("delta"), len(str(total_delta)))
-    fold_width = len("fold")
-
-    header = (
-        f"{'class':<{name_width}}  {'root':>{root_width}}  "
-        f"{'target':>{target_width}}  {'delta':>{delta_width}}  {'fold':>{fold_width}}"
-    )
-    divider = "-" * len(header)
-
-    print(f"ROOT  : {root_dir}")
-    print(f"TARGET: {target_dir}")
-    print(header)
-    print(divider)
-    for class_name, root_count, target_count, delta, fold in rows:
+        print(f"ROOT  : {root_dir}")
+        print(f"TARGET: {target_dir}")
+        print(header)
+        print(divider)
+        for class_name, root_videos, root_jpeg, target_count in rows:
+            print(
+                f"{class_name:<{name_width}}  {root_videos:>{videos_width}}  "
+                f"{root_jpeg:>{jpeg_width}}  {target_count:>{target_width}}"
+            )
+        print(divider)
         print(
-            f"{class_name:<{name_width}}  {root_count:>{root_width}}  "
-            f"{target_count:>{target_width}}  {delta:>{delta_width}}  {fold:>{fold_width}.2f}x"
+            f"{'TOTAL':<{name_width}}  {total_root_videos:>{videos_width}}  "
+            f"{total_root_jpeg:>{jpeg_width}}  {total_target:>{target_width}}"
         )
-    print(divider)
-    print(
-        f"{'TOTAL':<{name_width}}  {total_root:>{root_width}}  "
-        f"{total_target:>{target_width}}  {total_delta:>{delta_width}}  {total_fold:>{fold_width}.2f}x"
-    )
+    else:
+        rows: list[tuple[str, int, int, int, float]] = []
+        total_root = 0
+        total_target = 0
+
+        for class_name in classes:
+            root_count = count_files_with_suffix(root_dir / class_name, IMAGE_SUFFIXES)
+            target_count = count_files_with_suffix(
+                target_dir / class_name, IMAGE_SUFFIXES
+            )
+            delta = target_count - root_count
+            fold = (target_count / root_count) if root_count > 0 else 0.0
+            rows.append((class_name, root_count, target_count, delta, fold))
+            total_root += root_count
+            total_target += target_count
+
+        total_delta = total_target - total_root
+        total_fold = (total_target / total_root) if total_root > 0 else 0.0
+
+        name_width = max(len("class"), max(len(name) for name, _, _, _, _ in rows))
+        root_width = max(len("root"), len(str(total_root)))
+        target_width = max(len("target"), len(str(total_target)))
+        delta_width = max(len("delta"), len(str(total_delta)))
+        fold_width = len("fold")
+
+        header = (
+            f"{'class':<{name_width}}  {'root':>{root_width}}  "
+            f"{'target':>{target_width}}  {'delta':>{delta_width}}  {'fold':>{fold_width}}"
+        )
+        divider = "-" * len(header)
+
+        print(f"ROOT  : {root_dir}")
+        print(f"TARGET: {target_dir}")
+        print(header)
+        print(divider)
+        for class_name, root_count, target_count, delta, fold in rows:
+            print(
+                f"{class_name:<{name_width}}  {root_count:>{root_width}}  "
+                f"{target_count:>{target_width}}  {delta:>{delta_width}}  {fold:>{fold_width}.2f}x"
+            )
+        print(divider)
+        print(
+            f"{'TOTAL':<{name_width}}  {total_root:>{root_width}}  "
+            f"{total_target:>{target_width}}  {total_delta:>{delta_width}}  {total_fold:>{fold_width}.2f}x"
+        )
 
 
 if __name__ == "__main__":

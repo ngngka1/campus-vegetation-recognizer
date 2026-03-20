@@ -46,17 +46,50 @@ def pick_examples(
     y_pred: np.ndarray,
     confidences: np.ndarray,
     *,
-    max_items: int = 12,
-) -> tuple[list[tuple[str, str, str, float]], list[tuple[str, str, str, float]]]:
+    one_per_class: bool = True,
+) -> tuple[
+    list[tuple[str, str, str, float]],
+    list[tuple[str, str, str, float]],
+    list[tuple[str, tuple[str, str, str, float] | None, tuple[str, str, str, float] | None]],
+]:
+    """
+    Pick correct and wrong prediction examples.
+    If one_per_class=True, returns 1 correct and 1 wrong example per class
+    (highest-confidence correct, lowest-confidence wrong per class).
+    Returns (correct_rows, wrong_rows, per_class_tuples).
+    """
     rows = [
         (str(path), str(t), str(p), float(c))
         for path, t, p, c in zip(paths, y_true, y_pred, confidences)
     ]
-    correct = [r for r in rows if r[1] == r[2]]
-    wrong = [r for r in rows if r[1] != r[2]]
-    correct.sort(key=lambda x: x[3], reverse=True)
-    wrong.sort(key=lambda x: x[3])
-    return correct[:max_items], wrong[:max_items]
+    correct_all = [r for r in rows if r[1] == r[2]]
+    wrong_all = [r for r in rows if r[1] != r[2]]
+    classes = sorted(set(r[1] for r in rows))
+
+    if one_per_class:
+        correct_rows: list[tuple[str, str, str, float]] = []
+        wrong_rows: list[tuple[str, str, str, float]] = []
+        per_class: list[
+            tuple[str, tuple[str, str, str, float] | None, tuple[str, str, str, float] | None]
+        ] = []
+        for cls in classes:
+            cls_correct = [r for r in correct_all if r[1] == cls]
+            cls_wrong = [r for r in wrong_all if r[1] == cls]
+            cls_correct.sort(key=lambda x: x[3], reverse=True)
+            cls_wrong.sort(key=lambda x: x[3])
+            correct_row = cls_correct[0] if cls_correct else None
+            wrong_row = cls_wrong[0] if cls_wrong else None
+            if correct_row:
+                correct_rows.append(correct_row)
+            if wrong_row:
+                wrong_rows.append(wrong_row)
+            per_class.append((cls, correct_row, wrong_row))
+        return correct_rows, wrong_rows, per_class
+
+    correct_all.sort(key=lambda x: x[3], reverse=True)
+    wrong_all.sort(key=lambda x: x[3])
+    per_class = []
+    return correct_all[:12], wrong_all[:12], per_class
 
 
 def margin_confidence(estimator: object, x: np.ndarray) -> np.ndarray:
@@ -90,6 +123,32 @@ def write_examples_csv(path: Path, rows: list[tuple[str, str, str, float]]) -> N
         writer = csv.writer(f)
         writer.writerow(["image_path", "true_label", "pred_label", "confidence"])
         writer.writerows(rows)
+
+
+def write_examples_per_class_csv(
+    path: Path,
+    per_class: list[tuple[str, tuple[str, str, str, float] | None, tuple[str, str, str, float] | None]],
+) -> None:
+    """Write one row per class with correct and wrong example columns."""
+    with path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "class",
+            "correct_image_path", "correct_confidence",
+            "wrong_image_path", "wrong_pred_label", "wrong_confidence",
+        ])
+        for cls, correct, wrong in per_class:
+            if correct is not None:
+                c_path, _, _, c_conf = correct
+                c_conf_str = f"{c_conf:.6f}"
+            else:
+                c_path, c_conf_str = "", ""
+            if wrong is not None:
+                w_path, _, w_pred, w_conf = wrong
+                w_conf_str = f"{w_conf:.6f}"
+            else:
+                w_path, w_pred, w_conf_str = "", "", ""
+            writer.writerow([cls, c_path, c_conf_str, w_path, w_pred, w_conf_str])
 
 
 def normalize_confusion_matrix(cm: np.ndarray) -> np.ndarray:
@@ -243,11 +302,12 @@ def write_traditional_ml_outputs(
     dataset_dir = Path(run_data.dataset_dir)
     seed = run_data.seed
     train_results: list[TrainResult] = run_data.train_results
+    train_results_sorted_by_test_accuracy = run_data.train_results_sorted_by_test_accuracy
 
     split = run_data.split
     val_idx_for_eval = np.asarray(run_data.val_idx_for_eval, dtype=np.int64)
 
-    top_results = train_results[: min(3, len(train_results))]
+    top_results = train_results_sorted_by_test_accuracy[: min(3, len(train_results_sorted_by_test_accuracy))]
     best = top_results[0]
     test_acc = float(best.test_accuracy)
     report_dict: dict[str, dict[str, float]] = {}
@@ -288,18 +348,6 @@ def write_traditional_ml_outputs(
             y_val_pred = np.asarray(y_val_pred_raw, dtype=object)
             cm_val = confusion_matrix(y_val_true, y_val_pred, labels=class_names)
             cm_val_norm = normalize_confusion_matrix(cm_val)
-
-            write_confusion_csv(
-                output_dir / f"confusion_matrix_top{rank}_val_{result_slug}.csv",
-                class_names,
-                cm_val,
-            )
-            write_confusion_csv(
-                output_dir
-                / f"confusion_matrix_top{rank}_val_normalized_{result_slug}.csv",
-                class_names,
-                cm_val_norm,
-            )
 
             if (
                 test_labels is not None
@@ -342,10 +390,6 @@ def write_traditional_ml_outputs(
                 cm_test_norm = cm_test_norm_rank
 
                 # Backward-compatible filenames for best model artifacts.
-                write_confusion_csv(output_dir / "confusion_matrix_val.csv", class_names, cm)
-                write_confusion_csv(
-                    output_dir / "confusion_matrix_val_normalized.csv", class_names, cm_norm
-                )
                 if cm_test.size:
                     write_confusion_csv(
                         output_dir / "confusion_matrix_test.csv", class_names, cm_test
@@ -356,34 +400,73 @@ def write_traditional_ml_outputs(
                         cm_test_norm,
                     )
 
-        loaded_dataset_paths = getattr(run_data, "paths", None)
-        loaded_dataset_paths_arr = (
-            np.asarray(loaded_dataset_paths, dtype=object)
-            if loaded_dataset_paths is not None
+        # Use test set for qualitative examples when available
+        test_paths = getattr(run_data, "test_paths", None)
+        test_paths_arr = (
+            np.asarray(test_paths, dtype=object)
+            if test_paths is not None
             else None
         )
         if (
-            loaded_dataset_paths_arr is None
-            or loaded_dataset_paths_arr.ndim != 1
-            or loaded_dataset_paths_arr.size != len(labels)
+            test_labels is not None
+            and test_feature_sets is not None
+            and best.feature_name in test_feature_sets
+            and len(test_labels) == len(test_feature_sets[best.feature_name])
         ):
-            example_paths = np.asarray(
-                [f"<image_{i}>" for i in range(len(labels))], dtype=object
+            x_test = test_feature_sets[best.feature_name]
+            y_test_pred = np.asarray(best.estimator.predict(x_test), dtype=object)
+            y_test_conf = margin_confidence(best.estimator, x_test)
+            if (
+                test_paths_arr is not None
+                and test_paths_arr.ndim == 1
+                and test_paths_arr.size == len(test_labels)
+            ):
+                example_paths = test_paths_arr
+            else:
+                example_paths = np.asarray(
+                    [f"<test_image_{i}>" for i in range(len(test_labels))],
+                    dtype=object,
+                )
+            correct_rows, wrong_rows, per_class = pick_examples(
+                paths=example_paths,
+                y_true=test_labels,
+                y_pred=y_test_pred,
+                confidences=y_test_conf,
             )
         else:
-            example_paths = loaded_dataset_paths_arr
-        correct_rows, wrong_rows = pick_examples(
-            paths=example_paths[val_idx_for_eval],
-            y_true=y_val_true,
-            y_pred=np.asarray(best.estimator.predict(feature_sets[best.feature_name][val_idx_for_eval]), dtype=object),
-            confidences=y_val_conf,
-        )
+            # Fallback to val set when test set is not available
+            loaded_dataset_paths = getattr(run_data, "paths", None)
+            loaded_dataset_paths_arr = (
+                np.asarray(loaded_dataset_paths, dtype=object)
+                if loaded_dataset_paths is not None
+                else None
+            )
+            if (
+                loaded_dataset_paths_arr is None
+                or loaded_dataset_paths_arr.ndim != 1
+                or loaded_dataset_paths_arr.size != len(labels)
+            ):
+                example_paths = np.asarray(
+                    [f"<image_{i}>" for i in range(len(labels))], dtype=object
+                )
+            else:
+                example_paths = loaded_dataset_paths_arr
+            correct_rows, wrong_rows, per_class = pick_examples(
+                paths=example_paths[val_idx_for_eval],
+                y_true=y_val_true,
+                y_pred=np.asarray(best.estimator.predict(feature_sets[best.feature_name][val_idx_for_eval]), dtype=object),
+                confidences=y_val_conf,
+            )
         write_examples_csv(
             output_dir / "qualitative_correct_examples.csv", correct_rows
         )
         write_examples_csv(
             output_dir / "qualitative_incorrect_examples.csv", wrong_rows
         )
+        if per_class:
+            write_examples_per_class_csv(
+                output_dir / "qualitative_examples_per_class.csv", per_class
+            )
 
         confusion_pairs = top_k_confusions(cm, class_names)
 
@@ -398,7 +481,7 @@ def write_traditional_ml_outputs(
             "test_accuracy": r.test_accuracy,
             "train_seconds": r.train_seconds,
         }
-        for r in train_results
+        for r in train_results_sorted_by_test_accuracy
     ]
     (output_dir / "train_results.json").write_text(
         json.dumps(train_results_payload, indent=2), encoding="utf-8"
@@ -411,8 +494,6 @@ def write_traditional_ml_outputs(
             "features": r.feature_name,
             "pipeline": f"{r.model_name}: {r.feature_name}",
             "slug": pipeline_slug(r),
-            "val_confusion_matrix_csv": f"confusion_matrix_top{idx+1}_val_{pipeline_slug(r)}.csv",
-            "val_confusion_matrix_normalized_csv": f"confusion_matrix_top{idx+1}_val_normalized_{pipeline_slug(r)}.csv",
             "test_confusion_matrix_csv": f"confusion_matrix_top{idx+1}_test_{pipeline_slug(r)}.csv",
             "test_confusion_matrix_normalized_csv": f"confusion_matrix_top{idx+1}_test_normalized_{pipeline_slug(r)}.csv",
         }
@@ -424,7 +505,7 @@ def write_traditional_ml_outputs(
         "seed": seed,
         "dataset_class_counts": len(class_names),
         "evaluated_feature_combinations": sorted(
-            {r.feature_name for r in train_results}
+            {r.feature_name for r in train_results_sorted_by_test_accuracy}
         ),
         "splits": {
             "train": int(len(split.train)),
@@ -445,7 +526,7 @@ def write_traditional_ml_outputs(
         split=split,
         test_size=test_size,
         class_names=class_names,
-        train_results=train_results,
+        train_results=train_results_sorted_by_test_accuracy,
         test_acc=test_acc,
         per_class_report=report_dict,
         confusion_pairs=confusion_pairs,
