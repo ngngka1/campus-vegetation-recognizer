@@ -74,6 +74,13 @@ class TrainCandidatesOutput:
     fitted_pcas_full_cv: dict[str, PCA] | None = None
 
 
+def _truncate_for_bar(s: str, max_len: int) -> str:
+    s = str(s)
+    if len(s) <= max_len:
+        return s
+    return s[: max_len - 1] + "…"
+
+
 def _pair_progress_bar(total_pairs: int):
     if tqdm is None:
         return None
@@ -81,8 +88,44 @@ def _pair_progress_bar(total_pairs: int):
         total=total_pairs,
         desc="Training model-feature pairs",
         unit="pair",
-        bar_format="{desc} {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} pairs",
+        dynamic_ncols=True,
+        mininterval=0.2,
+        bar_format="{desc}  {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} pairs  {postfix}",
     )
+
+
+def _emit_training_pair_progress(
+    bar,
+    *,
+    show_progress: bool,
+    model_name: str,
+    feature_name: str,
+    val_acc: float,
+    train_acc: float,
+    train_seconds: float,
+    test_accuracy: float,
+    has_test: bool,
+) -> None:
+    """Single-line progress: padded candidate + metrics (no extra newlines)."""
+    if not show_progress:
+        return
+    mod_disp = _truncate_for_bar(model_name, 22)
+    feat_disp = _truncate_for_bar(feature_name, 48)
+    desc = f"  {mod_disp:<24} |  {feat_disp:<48}"
+    parts = [
+        f"val={val_acc:.4f}",
+        f"train={train_acc:.4f}",
+        f"time={train_seconds:.1f}s",
+    ]
+    if has_test:
+        parts.insert(1, f"test={test_accuracy:.4f}")
+    postfix = "  ".join(parts)
+    if bar is not None:
+        bar.set_description(desc, refresh=False)
+        bar.set_postfix_str(postfix, refresh=True)
+        bar.update(1)
+    else:
+        print(f"{desc}  {postfix}", flush=True)
 
 
 def train_candidates(
@@ -162,8 +205,6 @@ def train_candidates(
             neginf=0.0,
         ).astype(np.float32)
         y_pool = cv_pool_labels
-        if bar is not None:
-            bar.set_description(f"Training [{model_name} | {feature_name}]")
         cv_train_scores: list[float] = []
         cv_val_scores: list[float] = []
         cv_fit_seconds = 0.0
@@ -242,25 +283,18 @@ def train_candidates(
         else:
             test_accuracy = float("nan")
 
-        if show_progress:
-            val_folds_str = ", ".join(f"{score:.4f}" for score in cv_val_scores)
-            log_line = (
-                f"[{model_name} | {feature_name}] \n"
-                f"val_acc={val_acc:.4f}, "
-                f"val_folds=[{val_folds_str}], train_acc={train_acc:.4f}, time={train_seconds:.1f}s"
-            )
-            if test_labels is not None and test_feature_sets is not None:
-                log_line = (
-                f"[{model_name} | {feature_name}] \n"
-                f"test_acc={test_accuracy:.4f}, val_acc={val_acc:.4f}, "
-                f"val_folds=[{val_folds_str}], train_acc={train_acc:.4f}, time={train_seconds:.1f}s"
-            )
-            if tqdm is not None:
-                tqdm.write(log_line)
-            else:
-                print(log_line)
-        if bar is not None:
-            bar.update(1)
+        has_test = test_labels is not None and test_feature_sets is not None
+        _emit_training_pair_progress(
+            bar,
+            show_progress=show_progress,
+            model_name=model_name,
+            feature_name=feature_name,
+            val_acc=val_acc,
+            train_acc=train_acc,
+            train_seconds=train_seconds,
+            test_accuracy=test_accuracy,
+            has_test=has_test,
+        )
         results.append(
             TrainResult(
                 model_name=model_name,
@@ -336,8 +370,6 @@ def _train_candidates_pca_per_fold(
     pca_test_features_cache: dict[str, np.ndarray] = {}
 
     for model_name, feature_name in candidates:
-        if bar is not None:
-            bar.set_description(f"Training [{model_name} | {feature_name}]")
         cv_train_scores: list[float] = []
         cv_val_scores: list[float] = []
         cv_fit_seconds = 0.0
@@ -468,21 +500,18 @@ def _train_candidates_pca_per_fold(
         else:
             test_accuracy = float("nan")
 
-        if show_progress:
-            val_folds_str = ", ".join(f"{score:.4f}" for score in cv_val_scores)
-            log_line = (
-                f"[{model_name} | {feature_name}] \n"
-                f"val_acc={val_acc:.4f}, "
-                f"val_folds=[{val_folds_str}], train_acc={train_acc:.4f}, time={train_seconds:.1f}s"
-            )
-            if test_labels is not None and test_base_features is not None:
-                log_line += f", test_acc={test_accuracy:.4f}"
-            if tqdm is not None:
-                tqdm.write(log_line)
-            else:
-                print(log_line)
-        if bar is not None:
-            bar.update(1)
+        has_test = test_labels is not None and test_base_features is not None
+        _emit_training_pair_progress(
+            bar,
+            show_progress=show_progress,
+            model_name=model_name,
+            feature_name=feature_name,
+            val_acc=val_acc,
+            train_acc=train_acc,
+            train_seconds=train_seconds,
+            test_accuracy=test_accuracy,
+            has_test=has_test,
+        )
         results.append(
             TrainResult(
                 model_name=model_name,
