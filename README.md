@@ -1,5 +1,8 @@
 # Vegetation Classification Assignment
 
+[The report for the assignment](Report.pdf)
+
+
 ## Setup
 
 ```bash
